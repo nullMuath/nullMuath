@@ -1,0 +1,530 @@
+name: Update stats
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # daily, 00:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Regenerate stats and visitors cards
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          """Regenerates assets/cards/stats.svg and assets/cards/visitors.svg (run by the daily workflow)."""
+          from html import escape
+          from pathlib import Path
+          import base64
+          import math
+          import textwrap
+
+          OUT = Path("assets/cards")
+
+          GITHUB_USER = "nullMuath"
+
+          TEXT, MUTED = "#c9d1d9", "#8b949e"
+
+          GREEN = "#4ae854"
+
+          MONO = "ui-monospace,SFMono-Regular,'JetBrains Mono',Consolas,'Liberation Mono',Menlo,monospace"
+
+          CW = 0.61  # approx monospace char width / font-size
+
+          def t(s):
+              return escape(str(s), quote=True)
+
+          def text(x, y, s, size=13, fill=TEXT, weight=400, anchor="start", extra=""):
+              return (f'<text x="{x}" y="{y}" font-size="{size}" fill="{fill}" font-weight="{weight}" '
+                      f'text-anchor="{anchor}" {extra}>{t(s)}</text>')
+
+          HEAD = "Archivo,'Archivo Black','Arial Black','Helvetica Neue',Arial,sans-serif"
+
+          BODY = "'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif"
+
+          CARD, BOX = "#0E1A12", "#16271B"
+
+          ECHO = ["#FFFFFF", "#6E6E6E", "#4C4C4C", "#363636"]
+
+          QUIET = "#8A8A8A"
+
+          def ascii_texture(w, h, seed=7):
+              """Faint diagonal bands of ASCII, like the background of the site's About room."""
+              import random
+              rng = random.Random(seed)
+              chars = "#*0=+.:-o@%"
+              out = []
+              for x0, slope in ((40, 0.55), (330, -0.45)):
+                  for row, y in enumerate(range(60, h - 20, 16)):
+                      bx = x0 + slope * y + 30 * (rng.random() - 0.5)
+                      run = "".join(rng.choice(chars) for _ in range(rng.randint(3, 7)))
+                      out.append(f'<text x="{bx:.0f}" y="{y}" font-size="13" fill="#1f6b2a">{t(run)}</text>')
+              return f'<g font-family="{MONO}" opacity="0.45">' + "".join(out) + "</g>"
+
+          FPS = 12   # motion is stepped at this frame rate on purpose: choppy, like the site, not buttery
+
+          def ease(x, p1=(0.22, 1.0), p2=(0.36, 1.0)):
+              """cubic-bezier(0.22,1,0.36,1) evaluated at progress x (0..1)."""
+              def bez(t, a, b):
+                  return 3 * a * t * (1 - t) ** 2 + 3 * b * t ** 2 * (1 - t) + t ** 3
+              lo, hi = 0.0, 1.0
+              for _ in range(40):                    # solve bez_x(t) = x
+                  mid = (lo + hi) / 2
+                  if bez(mid, p1[0], p2[0]) < x:
+                      lo = mid
+                  else:
+                      hi = mid
+              return bez((lo + hi) / 2, p1[1], p2[1])
+
+          def stepped(attr, a, b, begin, dur, transform=False):
+              """An animate that jumps between eased frames at FPS instead of tweening smoothly."""
+              n = max(2, round(dur * FPS))
+              frames = [ease(i / n) for i in range(n + 1)]
+              if transform:
+                  vals = ";".join(f"0 {a + (b - a) * f:.2f}" for f in frames)
+                  tag = f'animateTransform attributeName="transform" type="translate"'
+              else:
+                  vals = ";".join(f"{a + (b - a) * f:.3f}" for f in frames)
+                  tag = f'animate attributeName="{attr}"'
+              keys = ";".join(f"{i / n:.4f}" for i in range(n + 1))
+              return (f'<{tag} values="{vals}" keyTimes="{keys}" calcMode="discrete" '
+                      f'dur="{dur:.2f}s" begin="{begin:.2f}s" fill="freeze"/>')
+
+          def rise(begin, inner, dy=18, dur=0.72):
+              return ('<g opacity="0">' + stepped("opacity", 0, 1, begin, dur * 0.86)
+                      + stepped(None, dy, 0, begin, dur, transform=True) + inner + "</g>")
+
+          def type_text(x, y, s, size, fill, begin, dur=0.7, weight=800, extra=""):
+              """Each prefix of the string is its own <text>, shown for one beat, the full string stays."""
+              n = len(s)
+              out = []
+              for k in range(1, n + 1):
+                  t0 = begin + dur * (k - 1) / n
+                  last = k == n
+                  end = "" if last else f'<set attributeName="visibility" to="hidden" begin="{begin + dur * k / n:.3f}s" fill="freeze"/>'
+                  out.append(f'<g visibility="hidden"><set attributeName="visibility" to="visible" begin="{t0:.3f}s" fill="freeze"/>{end}'
+                             f'{text(x, y, s[:k], size, fill, weight, extra=extra)}</g>')
+              return f'<g opacity="0">{stepped("opacity", 0, 1, begin, 0.2)}{"".join(out)}</g>'
+
+          def _events(events, T, start):
+              """discrete values/keyTimes from [(time, value), ...] — the state before the first event is `start`."""
+              ev = sorted((t % T, v) for t, v in events)
+              keys, vals = ["0"], [str(start)]
+              for t, v in ev:
+                  if t <= 0:
+                      vals[0] = str(v)
+                      continue
+                  keys.append(f"{t/T:.4f}")
+                  vals.append(str(v))
+              return f'values="{";".join(vals)}" keyTimes="{";".join(keys)}" calcMode="discrete" dur="{T}s" repeatCount="indefinite"'
+
+          def _ramp(t0, dur, a, b):
+              """stepped ease from a to b over dur seconds at FPS, as events."""
+              n = max(1, round(dur * FPS))
+              return [(t0 + k / FPS, f"{a + (b - a) * ease(k / n):.2f}") for k in range(n + 1)]
+
+          STATUS_MOODS = [
+              ((10, 0), "locked in"),
+              ((5, 0), "productive"),
+              ((1, 0), "messing around"),
+              ((0, 1), "chillin'"),
+              ((0, 0), "sleepin'"),
+          ]
+
+          _STATS = None
+
+          def stats_data():
+              """fetch_stats_data(), but only once per run (the who-am-i header and the stats card both use it)."""
+              global _STATS
+              if _STATS is None:
+                  _STATS = fetch_stats_data()
+              return _STATS
+
+          def fetch_stats_data():
+              """
+              Fetches 52-week contribution calendar and language breakdown for GITHUB_USER.
+              Priority:
+                1. GitHub GraphQL API (if GITHUB_TOKEN is set in environment)
+                2. Public contributions API (jogruber.de)
+                3. Built-in fallback numbers
+              """
+              import os
+              import json
+              import urllib.request
+              from datetime import datetime, date, timedelta
+
+              total = 1526
+              longest = 5
+              langs = [("Java", 61.7), ("Python", 32.0), ("CSS", 3.8)]
+              days_map = {}
+
+              # 1. Try GraphQL if token is available
+              token = os.environ.get("GITHUB_TOKEN")
+              if token:
+                  try:
+                      query = """
+                      query($login: String!) {
+                        user(login: $login) {
+                          contributionsCollection {
+                            contributionCalendar {
+                              totalContributions
+                              weeks {
+                                contributionDays {
+                                  contributionCount
+                                  date
+                                  weekday
+                                }
+                              }
+                            }
+                          }
+                          repositories(ownerAffiliations: OWNER, first: 100, isFork: false) {
+                            nodes {
+                              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                                edges {
+                                  size
+                                  node { name }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                      """
+                      req = urllib.request.Request(
+                          "https://api.github.com/graphql",
+                          data=json.dumps({"query": query, "variables": {"login": GITHUB_USER}}).encode("utf-8"),
+                          headers={"Authorization": f"bearer {token}", "User-Agent": "profile-stats-builder"}
+                      )
+                      with urllib.request.urlopen(req, timeout=8) as r:
+                          res = json.load(r)
+                          user_data = res.get("data", {}).get("user", {})
+                          if user_data:
+                              cal = user_data.get("contributionsCollection", {}).get("contributionCalendar", {})
+                              if "totalContributions" in cal:
+                                  total = cal["totalContributions"]
+                              for w in cal.get("weeks", []):
+                                  for d in w.get("contributionDays", []):
+                                      days_map[d["date"]] = {"date": d["date"], "count": d["contributionCount"]}
+                              # Language sizes
+                              lang_totals = {}
+                              for repo in user_data.get("repositories", {}).get("nodes", []):
+                                  for edge in repo.get("languages", {}).get("edges", []):
+                                      lname = edge["node"]["name"]
+                                      lang_totals[lname] = lang_totals.get(lname, 0) + edge["size"]
+                              if lang_totals:
+                                  s_all = sum(lang_totals.values())
+                                  sorted_langs = sorted(lang_totals.items(), key=lambda x: x[1], reverse=True)[:3]
+                                  langs = [(k, round(v / s_all * 100, 1)) for k, v in sorted_langs]
+
+                      # The calendar above only covers the last 52 weeks. For a true ALL TIME total (and an
+                      # all-time longest streak), fetch every year the account has contributions in and sum them.
+                      def gql(q):
+                          rq = urllib.request.Request(
+                              "https://api.github.com/graphql",
+                              data=json.dumps({"query": q, "variables": {"login": GITHUB_USER}}).encode("utf-8"),
+                              headers={"Authorization": f"bearer {token}", "User-Agent": "profile-stats-builder"})
+                          with urllib.request.urlopen(rq, timeout=8) as r2:
+                              return json.load(r2).get("data", {}).get("user", {}) or {}
+
+                      years = gql("query($login: String!) { user(login: $login) { contributionsCollection { contributionYears } } }"
+                                  ).get("contributionsCollection", {}).get("contributionYears", [])
+                      if years:
+                          parts = " ".join(
+                              f'y{y}: contributionsCollection(from: "{y}-01-01T00:00:00Z", to: "{y}-12-31T23:59:59Z") '
+                              f'{{ contributionCalendar {{ totalContributions weeks {{ contributionDays {{ date contributionCount }} }} }} }}'
+                              for y in years)
+                          per_year = gql(f"query($login: String!) {{ user(login: $login) {{ {parts} }} }}")
+                          if per_year:
+                              total = sum(v["contributionCalendar"]["totalContributions"] for v in per_year.values())
+                              for v in per_year.values():
+                                  for wk in v["contributionCalendar"]["weeks"]:
+                                      for d in wk["contributionDays"]:
+                                          days_map[d["date"]] = {"date": d["date"], "count": d["contributionCount"]}
+                  except Exception as e:
+                      print("GraphQL fetch failed, trying public fallback:", e)
+
+              # 2. Public fallback if days_map is still empty
+              if not days_map:
+                  try:
+                      url = f"https://github-contributions-api.jogruber.de/v4/{GITHUB_USER}"
+                      req = urllib.request.Request(url, headers={"User-Agent": "profile-stats-builder"})
+                      with urllib.request.urlopen(req, timeout=6) as r:
+                          data = json.load(r)
+                      for item in data.get("contributions", []):
+                          days_map[item["date"]] = item
+                      if data.get("total"):
+                          total = sum(data["total"].values())
+                  except Exception as e:
+                      print("Public contributions API unreachable, using baseline:", e)
+
+              # Calculate longest streak
+              sorted_dates = sorted(days_map.keys())
+              cur_streak = 0
+              max_streak = 0
+              for dt in sorted_dates:
+                  if days_map[dt].get("count", 0) > 0:
+                      cur_streak += 1
+                      if cur_streak > max_streak:
+                          max_streak = cur_streak
+                  else:
+                      cur_streak = 0
+              if max_streak > 0:
+                  longest = max_streak
+
+              # Build 52-week calendar matrix ending on the current week
+              today = date.today()
+              sun_offset = (today.weekday() + 1) % 7
+              current_sun = today - timedelta(days=sun_offset)
+              start_date = current_sun - timedelta(weeks=51)
+
+              weeks = []
+              months = []
+              last_month = None
+
+              for w in range(52):
+                  w_start = start_date + timedelta(weeks=w)
+                  m = w_start.strftime("%b").upper()
+                  if m != last_month:
+                      if months and w - months[-1][0] < 3:
+                          months.pop()          # a sliver of a month at the start would collide with the next label
+                      months.append((w, m))
+                      last_month = m
+
+                  week_days = []
+                  for day_i in range(7):
+                      cur_d = w_start + timedelta(days=day_i)
+                      d_str = cur_d.isoformat()
+                      info = days_map.get(d_str, {"date": d_str, "count": 0, "level": 0})
+                      is_future = cur_d > today
+                      is_today = cur_d == today
+
+                      cnt = info.get("count", 0)
+                      if "level" in info and info["level"] is not None:
+                          lvl = info["level"]
+                      else:
+                          lvl = 0 if cnt == 0 else (1 if cnt <= 2 else (2 if cnt <= 5 else (3 if cnt <= 9 else 4)))
+
+                      week_days.append({
+                          "date": d_str,
+                          "count": cnt,
+                          "level": lvl,
+                          "is_future": is_future,
+                          "is_today": is_today,
+                          "day_i": day_i
+                      })
+                  weeks.append(week_days)
+
+              first_year, last_year = start_date.year, today.year
+
+              # mood for the summary card, from real activity. The workflow runs just after midnight UTC, when
+              # "today" has barely started, so it reads the last full day (yesterday) and the past week.
+              yday = days_map.get((today - timedelta(days=1)).isoformat(), {}).get("count", 0)
+              week = sum(days_map.get((today - timedelta(days=k)).isoformat(), {}).get("count", 0) for k in range(1, 8))
+              mood = STATUS_MOODS[-1][1]
+              for (min_day, min_week), label in STATUS_MOODS:
+                  if yday >= min_day and week >= min_week:
+                      mood = label
+                      break
+              return {
+                  "total": total,
+                  "longest_streak": longest,
+                  "weeks": weeks,
+                  "months": months,
+                  "years": str(last_year) if first_year == last_year else f"{first_year}–{last_year}",
+                  "today": (today.day, today.strftime("%b").upper()),
+                  "mood": mood,
+                  "languages": langs
+              }
+
+          def build_stats():
+              """
+              Builds the animated 900x240 SVG stats card for nullMuath's profile.
+              Hero 52x7 ASCII contribution matrix + echo-stack metrics + language glyph bar.
+              Chopped 12 FPS discrete stepped motion.
+              """
+              data = stats_data()
+              w, h = 900, 240
+              head = f'font-family="{HEAD}" letter-spacing="-1"'
+
+              # Corner labels
+              corner_left = f'<text x="24" y="31" font-size="11" fill="{QUIET}">@nullMuath <tspan fill="{GREEN}">//</tspan> GIT LOG</text>'
+              corner_right = f'<text x="{w-24}" y="31" font-size="10.5" fill="{QUIET}" text-anchor="end">52 WEEKS <tspan fill="{GREEN}">//</tspan> {data["years"]}</text>'
+
+              # ── 52-week ASCII Matrix ──
+              gx0, gy0 = 50, 71
+              col_step = 9.8
+              row_step = 13.0
+
+              day_labels = []
+              for d_idx, d_name in [(1, "M"), (3, "W"), (5, "F")]:
+                  day_labels.append(f'<text x="36" y="{gy0 + d_idx * row_step + 1:.1f}" font-size="9" fill="{QUIET}" text-anchor="middle">{d_name}</text>')
+
+              month_labels = []
+              for col_idx, m_name in data["months"]:
+                  mx = gx0 + col_idx * col_step
+                  month_labels.append(f'<text x="{mx:.1f}" y="55" font-size="9" fill="{QUIET}">{m_name}</text>')
+
+              LEVEL_GLYPHS = ["·", "░", "▒", "▓", "█"]
+              LEVEL_COLORS = ["#1a3320", "#2a5a2e", "#3c7a3e", "#39a842", GREEN]
+
+              grid_svg = []
+              for c_idx, week in enumerate(data["weeks"]):
+                  for d_idx, day in enumerate(week):
+                      if day["is_future"]:
+                          continue
+                      x = gx0 + c_idx * col_step
+                      y = gy0 + d_idx * row_step
+                      lvl = min(4, max(0, day["level"]))
+                      glyph = LEVEL_GLYPHS[lvl]
+                      col = LEVEL_COLORS[lvl]
+
+                      if day["is_today"]:
+                          # 12 FPS discrete blinking terminal cursor on today's cell
+                          grid_svg.append(
+                              f'<g>'
+                              f'<text x="{x:.1f}" y="{y:.1f}" font-size="11" fill="{GREEN}">{glyph}'
+                              f'<animate attributeName="opacity" values="1;1;0.15;0.15" keyTimes="0;0.5;0.5;1" dur="1.1s" calcMode="discrete" repeatCount="indefinite"/>'
+                              f'</text>'
+                              f'<rect x="{x-1.5:.1f}" y="{y-9.5:.1f}" width="10" height="11.5" fill="none" stroke="{GREEN}" stroke-width="1" rx="1" opacity="0.8"/>'
+                              f'</g>'
+                          )
+                      else:
+                          grid_svg.append(f'<text x="{x:.1f}" y="{y:.1f}" font-size="11" fill="{col}">{glyph}</text>')
+
+              legend = (f'<text x="432" y="172" font-size="9" fill="{QUIET}">Less · '
+                        f'<tspan fill="{LEVEL_COLORS[1]}">░</tspan> '
+                        f'<tspan fill="{LEVEL_COLORS[2]}">▒</tspan> '
+                        f'<tspan fill="{LEVEL_COLORS[3]}">▓</tspan> '
+                        f'<tspan fill="{GREEN}">█</tspan> More</text>')
+
+              # ── Languages Bar ──
+              lang_header = f'<text x="48" y="172" font-size="9.5" fill="{QUIET}">TOP LANGUAGES <tspan fill="{GREEN}">//</tspan></text>'
+    
+              # 24 blocks bar mapped to top 3 languages
+              langs = data["languages"]
+              l1_name, l1_pct = langs[0] if len(langs) > 0 else ("Java", 61.7)
+              l2_name, l2_pct = langs[1] if len(langs) > 1 else ("Python", 32.0)
+              l3_name, l3_pct = langs[2] if len(langs) > 2 else ("CSS", 3.8)
+
+              b1 = max(1, round(24 * (l1_pct / 100)))
+              b2 = max(1, round(24 * (l2_pct / 100)))
+              b3 = max(1, 24 - b1 - b2)
+
+              lang_blocks = (
+                  f'<text x="48" y="192" font-size="12" font-family="{MONO}" letter-spacing="1">'
+                  f'<tspan fill="{GREEN}">{"▓" * b1}</tspan>'
+                  f'<tspan fill="#3c7a3e">{"▒" * b2}</tspan>'
+                  f'<tspan fill="#2a5a2e">{"░" * b3}</tspan>'
+                  f'</text>'
+              )
+              lang_tags = (
+                  f'<text x="48" y="212" font-size="10" font-family="{MONO}" fill="{QUIET}">'
+                  f'<tspan fill="#FFFFFF" font-weight="600">{t(l1_name)}</tspan> {l1_pct:.1f}%  ·  '
+                  f'<tspan fill="#FFFFFF" font-weight="600">{t(l2_name)}</tspan> {l2_pct:.1f}%  ·  '
+                  f'<tspan fill="#FFFFFF" font-weight="600">{t(l3_name)}</tspan> {l3_pct:.1f}%'
+                  f'</text>'
+              )
+
+              # ── Right Metrics Panel ──
+              px, py, pw, ph = 594, 42, 282, 176
+              panel_box = f'<rect x="{px}" y="{py}" width="{pw}" height="{ph}" rx="8" fill="{CARD}" stroke="#1c1c1c"/>'
+              panel_bar = (f'<text x="{px+16}" y="{py+17}" font-size="10" fill="{QUIET}">summary.log <tspan fill="{GREEN}">//</tspan></text>'
+                           f'<text x="{px+pw-16}" y="{py+17}" font-size="10" fill="{GREEN}" text-anchor="end"><tspan fill="{QUIET}">status:</tspan> {t(data["mood"])}</text>'
+                           f'<line x1="{px}" y1="{py+25}" x2="{px+pw}" y2="{py+25}" stroke="#1c1c1c"/>')
+
+              total_str = f"{data['total']:,}"
+              metric1 = (
+                  f'<text x="{px+16}" y="{py+56}" font-size="22" font-weight="800" fill="#FFFFFF" {head}>{total_str}</text>'
+                  f'<text x="{px+16}" y="{py+84}" font-size="10" fill="{QUIET}" letter-spacing="1.4">CONTRIBUTIONS <tspan fill="{GREEN}">//</tspan> ALL TIME</text>'
+              )
+
+              div_line = f'<line x1="{px+16}" y1="{py+100}" x2="{px+pw-16}" y2="{py+100}" stroke="#1c1c1c"/>'
+
+              streak_str = f"{data['longest_streak']} DAYS"
+              metric2 = (
+                  f'<text x="{px+16}" y="{py+131}" font-size="19" font-weight="800" fill="#FFFFFF" {head}>{streak_str}</text>'
+                  f'<text x="{px+16}" y="{py+159}" font-size="10" fill="{QUIET}" letter-spacing="1.4">LONGEST STREAK <tspan fill="{GREEN}">//</tspan> <tspan fill="{QUIET}">CONSECUTIVE</tspan></text>'
+              )
+
+              # today's date, top middle: the day the workflow last rebuilt this card
+              run_day, run_mon = data["today"]
+              run_date = (f'<text x="{w/2:.0f}" y="31" font-size="10.5" fill="{QUIET}" text-anchor="middle" letter-spacing="1.4">'
+                          f'{run_day} <tspan fill="{GREEN}">·</tspan> {run_mon}</text>')
+
+              right_panel = rise(0.2, panel_box + panel_bar + metric1 + div_line + metric2, dy=16)
+
+              return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="{MONO}">
+            <rect x="0.5" y="0.5" width="{w-1}" height="{h-1}" rx="10" fill="#000000" stroke="#1c1c1c"/>
+            <g opacity="0.38">{ascii_texture(w, h, seed=42)}</g>
+            {corner_left}
+            {corner_right}
+            {"".join(day_labels)}
+            {"".join(month_labels)}
+            {"".join(grid_svg)}
+            {legend}
+            {lang_header}
+            {lang_blocks}
+            {lang_tags}
+            {run_date}
+            {right_panel}
+          </svg>
+          """
+
+          def build_visitors():
+              """
+              Builds a custom visitor counter component matching nullMuath's design.
+              Format: visitors // 0082
+              No green box, number in MONO font fully white with leading zeros.
+              """
+              import json
+              import re
+              import urllib.request
+
+              count = 82
+              try:
+                  url = f"https://komarev.com/ghpvc/?username={GITHUB_USER}"
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=5) as r:
+                      svg = r.read().decode("utf-8")
+                      m = re.findall(r">(\d+)<", svg)
+                      if m:
+                          count = int(m[-1])
+              except Exception as e:
+                  print("Couldn't fetch visitor count, using baseline:", e)
+
+              w, h = 160, 32
+              padded = f"{count:04d}"
+
+              return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="{MONO}">
+            <rect x="0.5" y="0.5" width="{w-1}" height="{h-1}" rx="6" fill="#000000" stroke="#1c1c1c"/>
+            <text x="{w/2}" y="{h/2 + 4:.1f}" font-size="11" fill="{QUIET}" text-anchor="middle">visitors <tspan fill="{GREEN}">//</tspan> <tspan fill="#FFFFFF" font-weight="700">{padded}</tspan></text>
+          </svg>
+          """
+
+
+          if __name__ == "__main__":
+              OUT.mkdir(parents=True, exist_ok=True)
+              (OUT / "stats.svg").write_text(build_stats(), encoding="utf-8")
+              (OUT / "visitors.svg").write_text(build_visitors(), encoding="utf-8")
+              print("stats.svg + visitors.svg updated")
+          PY
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assets/cards/stats.svg assets/cards/visitors.svg
+          git diff --staged --quiet || git commit -m "Update stats"
+          git push
